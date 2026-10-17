@@ -1,0 +1,24 @@
+{
+	"name": "robotomarvin/dibi-datetime-migration",
+	"description": "Temporary drop-in replacement of dibi 3 Dibi\\DateTime that keeps mutable behaviour but reports every place where dibi 4/5 (immutable) would behave differently.",
+	"type": "library",
+	"license": "MIT",
+	"require": {
+		"php": ">=8.0",
+		"dibi/dibi": "~3.2.0"
+	},
+	"require-dev": {
+		"phpunit/phpunit": "^11.5 || ^12.0"
+	},
+	"autoload": {
+		"classmap": ["src/"],
+		"files": ["src/bootstrap.php"],
+		"exclude-from-classmap": ["vendor/dibi/dibi/src/Dibi/DateTime.php"]
+	},
+	"autoload-dev": {
+		"psr-4": {"Tests\\": "tests/"}
+	},
+	"config": {
+		"sort-packages": true
+	}
+}

@@ -27,7 +27,7 @@ final class Reporter
 	/** report also results of mutators that were never used (lower confidence, see README) */
 	public static bool $reportDiscarded = true;
 
-	/** each distinct problem (kind + call sites) is reported only once per process */
+	/** each distinct problem (kind + method + call sites) is reported only once per process */
 	public static bool $deduplicate = true;
 
 	public static int $errorLevel = E_USER_DEPRECATED;
@@ -112,6 +112,31 @@ final class Reporter
 			}
 		}
 		return 'unknown';
+	}
+
+
+	/**
+	 * Whether the file calling into the shim declares strict_types=1,
+	 * i.e. whether dibi 5 scalar parameter types throw TypeError there instead of coercing.
+	 */
+	public static function isStrictCaller(): bool
+	{
+		foreach (debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS) as $frame) {
+			if (isset($frame['file']) && !str_starts_with($frame['file'], self::shimDir())) {
+				return self::isStrictFile($frame['file']);
+			}
+		}
+		return false;
+	}
+
+
+	private static function isStrictFile(string $file): bool
+	{
+		static $cache = [];
+		return $cache[$file] ??= is_file($file) && preg_match(
+			'~^(?:#![^\n]*\n)?\s*<\?php(?:\s|/\*.*?\*/|//[^\n]*|#[^\n]*)*+declare\s*\((?:[^)]*,)?\s*strict_types\s*=\s*1\s*[,)]~si',
+			(string) file_get_contents($file, false, null, 0, 8192),
+		);
 	}
 
 

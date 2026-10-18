@@ -402,6 +402,198 @@ final class DateTimeTest extends TestCase
 		Reporter::$rethrow = false;
 		$this->assertTrue(true);
 	}
+
+
+	public function testMagicPropertyIsReported(): void
+	{
+		$date = new DateTime('2026-10-17 12:00:00');
+		$this->assertSame($date->getTimestamp(), $date->timestamp);
+		$this->assertSame([Reporter::REMOVED_API], $this->kinds());
+		$this->assertStringContainsString('$date->timestamp at ' . __FILE__ . ':' . (__LINE__ - 2), $this->reports[0]['message']);
+	}
+
+
+	public function testExtensionMethodIsReported(): void
+	{
+		DateTime::extensionMethod('shimTestTomorrow', fn(DateTime $d) => $d->modifyClone('+1 day'));
+		$this->assertSame([Reporter::REMOVED_API], $this->kinds());
+
+		$this->reports = [];
+		$date = new DateTime('2026-10-17 12:00:00');
+		$this->assertSame('2026-10-18', $date->shimTestTomorrow()->format('Y-m-d'));
+		$this->assertStringContainsString('shimTestTomorrow() at ' . __FILE__, $this->reports[0]['message']);
+	}
+
+
+	public function testUndefinedMethodStillThrows(): void
+	{
+		$this->expectException(\LogicException::class);
+		(new DateTime)->undefinedMethod();
+	}
+
+
+	public function testCreateFromImmutableIsReported(): void
+	{
+		$date = DateTime::createFromImmutable(new \DateTimeImmutable('2026-10-17 12:00:00'));
+		$this->assertInstanceOf(DateTime::class, $date);
+		$this->assertSame([Reporter::REMOVED_API], $this->kinds());
+	}
+
+
+	public function testFactoriesTrackStateEagerly(): void
+	{
+		$dates = [
+			DateTime::createFromFormat('Y-m-d H:i:s', '2026-10-17 12:00:00'),
+			DateTime::createFromInterface(new \DateTimeImmutable('2026-10-17 12:00:00')),
+		];
+		foreach ($dates as $date) {
+			date_modify($date, '+1 day');
+			$this->assertSame('2026-10-18', $date->format('Y-m-d'));
+		}
+		$this->assertSame([Reporter::DIVERGED_READ], $this->kinds()); // same site, deduplicated
+		$this->assertStringContainsString('untracked call', $this->reports[0]['message']);
+	}
+
+
+	public function testNumericConstructorInDstFoldDiffersInDibi5(): void
+	{
+		$timestamp = (new \DateTimeImmutable('2026-10-25 00:30:00 UTC'))->getTimestamp(); // 02:30 CEST, first occurrence
+		$date = new DateTime($timestamp);
+		$this->assertSame('02:30 +02:00', $date->format('H:i P')); // dibi 3 value
+		$this->assertSame([Reporter::DIVERGED_READ], $this->kinds());
+		$this->assertStringContainsString("in dibi 5 it returns '02:30 +01:00'", $this->reports[0]['message']);
+		$this->assertStringContainsString("new Dibi\\DateTime($timestamp) at " . __FILE__ . ':' . (__LINE__ - 4), $this->reports[0]['message']);
+
+		$this->reports = [];
+		$date->format('Y-m-d H:i'); // same in both versions
+		$this->assertSame([], $this->kinds());
+	}
+
+
+	public function testNumericConstructorAboveYear9999ThrowsInDibi5(): void
+	{
+		$date = new DateTime(253402300800);
+		$this->assertSame('10000-01-01', $date->format('Y-m-d'));
+		$this->assertSame([Reporter::WOULD_THROW], $this->kinds());
+	}
+
+
+	public function testNonScalarConstructorArgumentInStrictFile(): void
+	{
+		require_once __DIR__ . '/fixtures/coercive.php';
+		$date = new DateTime(new Fixtures\Stringable);
+		$this->assertSame('2020-01-01 10:00:00', $date->format('Y-m-d H:i:s')); // works like dibi 3
+		$date = new DateTime(1.5);
+		$this->assertSame('1970-01-01 01:00:01.500000', (string) $date);
+		$this->assertSame([Reporter::WOULD_THROW, Reporter::WOULD_THROW], $this->kinds());
+	}
+
+
+	public function testConstructorCoercionInNonStrictFile(): void
+	{
+		require_once __DIR__ . '/fixtures/coercive.php';
+		$date = Fixtures\newDateTime(new Fixtures\Stringable);
+		$this->assertSame('2020-01-01 10:00:00', $date->format('Y-m-d H:i:s'));
+		$this->assertSame([], $this->kinds());
+
+		$date = Fixtures\newDateTime(false); // dibi 3: now, dibi 5: 0 = 1970-01-01
+		$this->assertSame(date('Y'), $date->format('Y'));
+		$this->assertSame([Reporter::DIVERGED_READ], $this->kinds());
+		$this->assertStringContainsString("in dibi 5 it returns '1970'", $this->reports[0]['message']);
+	}
+
+
+	public function testSetTimestampCoercionInNonStrictFile(): void
+	{
+		require_once __DIR__ . '/fixtures/coercive.php';
+		$date = Fixtures\setTimestamp(new DateTime('2026-10-17 12:00:00'), '1700000000');
+		$date->format('Y-m-d H:i:s.u');
+		$this->assertSame([], $this->kinds());
+
+		$date = Fixtures\setTimestamp(new DateTime('2026-10-17 12:00:00'), '1700000000.5');
+		$date->format('Y-m-d H:i:s'); // fraction is not read
+		$this->assertSame([], $this->kinds());
+		$this->assertSame('500000', $date->format('u'));
+		$this->assertSame([Reporter::DIVERGED_READ], $this->kinds());
+	}
+
+
+	public function testSetTimestampBoolInNonStrictFile(): void
+	{
+		require_once __DIR__ . '/fixtures/coercive.php';
+		$date = Fixtures\setTimestamp(new DateTime('2026-10-17 12:00:00'), true);
+		$this->assertSame('1970-01-01 01:00:01', $date->format('Y-m-d H:i:s'));
+		$this->assertSame([], $this->kinds());
+	}
+
+
+	public function testSubclassCloneWithoutParentCallIsIndependent(): void
+	{
+		require_once __DIR__ . '/fixtures/coercive.php';
+		$date = new Fixtures\CloningSubDateTime('2026-10-17 12:00:00');
+		$date->modify('+1 day');
+		$copy = clone $date;
+		$copy->modify('+5 day');
+		Reporter::$enabled = false;
+		$this->assertSame('2026-10-18', $date->format('Y-m-d'));
+		$this->assertSame('2026-10-23', $copy->format('Y-m-d'));
+	}
+
+
+	public function testSetTimestampNumericStringInStrictFile(): void
+	{
+		$date = new DateTime('2026-10-17 12:00:00');
+		$date = $date->setTimestamp('1700000000');
+		$this->assertSame([Reporter::WOULD_THROW], $this->kinds());
+	}
+
+
+	public function testSubclassWithoutReturnTypesCompiles(): void
+	{
+		require_once __DIR__ . '/fixtures/coercive.php';
+		$date = new Fixtures\UntypedSubDateTime('2026-10-17 12:00:00');
+		$this->assertSame('2026-10-17', $date->format('Y-m-d'));
+	}
+
+
+	public function testCloneOfResultIsUsage(): void
+	{
+		$date = new DateTime('2026-10-17 12:00:00');
+		$copy = clone $date->setTime(5, 0);
+		$this->assertSame('05:00', $copy->format('H:i'));
+		$this->assertNotContains(Reporter::DISCARDED_RESULT, $this->kinds());
+	}
+
+
+	public function testNoOpMutationIsNotDiscarded(): void
+	{
+		$date = new DateTime('2026-10-17 00:00:00');
+		$date->setTime(0, 0);
+		$date->setTimezone(new \DateTimeZone('Europe/Prague'));
+		$this->assertSame('2026-10-17 00:00', $date->format('Y-m-d H:i'));
+		$this->assertSame([], $this->kinds());
+	}
+
+
+	public function testDifferentReadsOnSameLineAreReportedSeparately(): void
+	{
+		Reporter::$reportDiscarded = false;
+		$date = new DateTime('2026-10-17 12:00:00');
+		$date->modify('+1 day');
+		[$date->format('Y-m-d'), $date->getTimestamp()];
+		$this->assertSame([Reporter::DIVERGED_READ, Reporter::DIVERGED_READ], $this->kinds());
+	}
+
+
+	public function testDebugInfoShowsSubclassProperties(): void
+	{
+		$date = new SubDateTime('2026-10-17 12:00:00');
+		$date->pub = 'x';
+		$dump = print_r($date, true);
+		$this->assertStringContainsString('[pub] => x', $dump);
+		$this->assertStringContainsString('[date] => 2026-10-17 12:00:00.000000', $dump);
+		$this->assertStringNotContainsString('shadow', $dump);
+	}
 }
 
 

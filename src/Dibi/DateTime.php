@@ -16,10 +16,17 @@ use Dibi\DateTimeMigration\Usage;
  * DateTimeImmutable holding the value the same variable would have in dibi 4/5.
  * Mutators return a new object that shares state with the original (so dibi 3 semantics are kept),
  * and every read compares the real value with the shadow one and reports when they differ.
+ *
+ * Return types of overridden methods are left tentative (as in \DateTime), so subclasses without
+ * return types keep compiling like with dibi 3.
  */
 class DateTime extends \DateTime
 {
-	use Strict;
+	use Strict {
+		__get as private strictGet;
+		__call as private strictCall;
+		extensionMethod as private strictExtensionMethod;
+	}
 
 	/** marker checked by bootstrap.php */
 	public const MIGRATION_SHIM = true;
@@ -29,7 +36,12 @@ class DateTime extends \DateTime
 	/** value this object would hold in dibi 4/5 */
 	private ?\DateTimeImmutable $shadow = null;
 
-	/** @var array<string, string>  call site => mutating call that made the real value differ from $shadow */
+	/** cached STATE_FORMAT of $shadow */
+	private ?string $shadowState = null;
+
+	private ?\DateTimeImmutable $shadowStateOf = null;
+
+	/** @var array<string, string>  call site => call that made the real value differ from $shadow */
 	private array $divergedBy = [];
 
 	/** objects that are a single object in dibi 3 */
@@ -48,13 +60,35 @@ class DateTime extends \DateTime
 	 */
 	public function __construct($time = 'now', ?\DateTimeZone $timezone = null)
 	{
+		$site = null;
+		$dibi5Time = $time; // argument as dibi 5 constructor receives it, null when it throws
 		if ($time === null) {
 			Reporter::report(
 				Reporter::WOULD_THROW,
 				'new Dibi\DateTime(null) at ' . ($site = Reporter::callSite()) . ' throws TypeError in dibi 5.',
-				['site' => $site],
+				['site' => $site, 'call' => 'new(null)'],
 			);
 			$time = 'now';
+		} elseif (!is_string($time) && !is_int($time) && Reporter::$enabled) {
+			$site = Reporter::callSite();
+			if (Reporter::isStrictCaller()) {
+				Reporter::report(
+					Reporter::WOULD_THROW,
+					'new Dibi\DateTime(' . self::describe($time) . ") at $site throws TypeError in dibi 5, it accepts only string|int.",
+					['site' => $site, 'call' => 'new(' . get_debug_type($time) . ')'],
+				);
+				$dibi5Time = null;
+			} else { // coercion to string|int parameter, false becomes 0 = 1970-01-01
+				$dibi5Time = match (true) {
+					is_float($time) && abs($time) >= PHP_INT_MAX => (string) $time,
+					is_float($time), is_bool($time) => (int) $time,
+					$time instanceof \Stringable => (string) $time,
+					default => null,
+				};
+			}
+		}
+		if (is_bool($time) || $time instanceof \Stringable) {
+			$time = (string) $time; // dibi 3 class is not in strict_types mode
 		}
 
 		if (is_numeric($time)) {
@@ -66,18 +100,24 @@ class DateTime extends \DateTime
 			parent::__construct($time, $timezone);
 		}
 		$this->shadow = \DateTimeImmutable::createFromMutable($this);
+
+		if (Reporter::$enabled && $dibi5Time !== null && (is_numeric($dibi5Time) || $dibi5Time !== $time)) {
+			$this->initDibi5Construct($dibi5Time, $timezone, $site);
+		}
 	}
 
 
 	/** @deprecated  removed in dibi 5, use modify() */
 	public function modifyClone($modify = '')
 	{
-		$site = Reporter::callSite();
-		Reporter::report(
-			Reporter::REMOVED_API,
-			"modifyClone() at $site does not exist in dibi 5, use modify().",
-			['site' => $site],
-		);
+		if (Reporter::$enabled) {
+			$site = Reporter::callSite();
+			Reporter::report(
+				Reporter::REMOVED_API,
+				"modifyClone() at $site does not exist in dibi 5, use modify().",
+				['site' => $site, 'call' => 'modifyClone'],
+			);
+		}
 
 		$this->usage()->used = true;
 		$dolly = clone $this;
@@ -89,6 +129,85 @@ class DateTime extends \DateTime
 			$result->createdBy = null; // discarding result of modifyClone() is harmless in both versions
 		}
 		return $result;
+	}
+
+
+	/** @deprecated  removed in dibi 5, Dibi\DateTime extends DateTimeImmutable there */
+	#[\ReturnTypeWillChange]
+	public static function createFromImmutable(\DateTimeImmutable $object)
+	{
+		if (Reporter::$enabled) {
+			$site = Reporter::callSite();
+			Reporter::report(
+				Reporter::REMOVED_API,
+				"Dibi\\DateTime::createFromImmutable() at $site does not exist in dibi 5, use createFromInterface().",
+				['site' => $site, 'call' => 'createFromImmutable'],
+			);
+		}
+		return self::track(parent::createFromImmutable($object));
+	}
+
+
+	public static function createFromInterface(\DateTimeInterface $object): \DateTime
+	{
+		return self::track(parent::createFromInterface($object));
+	}
+
+
+	#[\ReturnTypeWillChange]
+	public static function createFromFormat(string $format, string $datetime, ?\DateTimeZone $timezone = null)
+	{
+		return self::track(parent::createFromFormat($format, $datetime, $timezone));
+	}
+
+
+	/********************* dibi 3 Strict trait, missing in dibi 5 ****************d*g**/
+
+
+	/** Magic properties $date->timestamp, $date->timezone, $date->offset, ... */
+	public function &__get($name)
+	{
+		if (Reporter::$enabled
+			&& (method_exists($this, $m = 'get' . $name) || method_exists($this, $m = 'is' . $name))
+			&& (new \ReflectionMethod($this, $m))->isPublic()
+		) {
+			$site = Reporter::callSite();
+			Reporter::report(
+				Reporter::REMOVED_API,
+				"\$date->$name at $site reads magic property of dibi 3, in dibi 5 it is undefined (Warning, returns null). Use $m().",
+				['site' => $site, 'call' => '->' . $name],
+			);
+		}
+		$value = $this->strictGet($name);
+		return $value;
+	}
+
+
+	public function __call($name, $args)
+	{
+		if (Reporter::$enabled && self::strictExtensionMethod(get_class($this) . '::' . $name)) {
+			$site = Reporter::callSite();
+			Reporter::report(
+				Reporter::REMOVED_API,
+				"$name() at $site is an extension method, dibi 5 has no extension methods (Error: Call to undefined method).",
+				['site' => $site, 'call' => $name . '()'],
+			);
+		}
+		return $this->strictCall($name, $args);
+	}
+
+
+	public static function extensionMethod($name, $callback = null)
+	{
+		if ($callback !== null && Reporter::$enabled) {
+			$site = Reporter::callSite();
+			Reporter::report(
+				Reporter::REMOVED_API,
+				"Dibi\\DateTime::extensionMethod() at $site does not exist in dibi 5.",
+				['site' => $site, 'call' => 'extensionMethod'],
+			);
+		}
+		return self::strictExtensionMethod($name, $callback);
 	}
 
 
@@ -150,19 +269,17 @@ class DateTime extends \DateTime
 	#[\ReturnTypeWillChange]
 	public function setTimestamp($timestamp)
 	{
+		$shadowArgs = null;
 		if (!is_int($timestamp) && Reporter::$enabled) {
-			$site = Reporter::callSite();
-			Reporter::report(
-				Reporter::WOULD_THROW,
-				'setTimestamp(' . self::describe($timestamp) . ") at $site requires int in dibi 5 (TypeError with strict_types, fraction is lost otherwise).",
-				['site' => $site],
-			);
+			$shadowArgs = (is_numeric($timestamp) || is_bool($timestamp)) && !Reporter::isStrictCaller()
+				? [(int) $timestamp] // coercion to int parameter, fraction is lost
+				: [$timestamp]; // shadow call throws TypeError, reported by mutate()
 		}
-		return $this->mutate(__FUNCTION__, func_get_args());
+		return $this->mutate(__FUNCTION__, func_get_args(), $shadowArgs);
 	}
 
 
-	/** PHP 8.4+ */
+	/** PHP 8.4+, native return type is not tentative */
 	public function setMicrosecond(int $microsecond): static
 	{
 		return $this->mutate(__FUNCTION__, func_get_args());
@@ -172,7 +289,8 @@ class DateTime extends \DateTime
 	/********************* readers ****************d*g**/
 
 
-	public function format(string $format): string
+	#[\ReturnTypeWillChange]
+	public function format(string $format)
 	{
 		$real = parent::format($format);
 		$this->verifyRead('format(' . self::describe($format) . ')', $real, fn(\DateTimeImmutable $s) => $s->format($format));
@@ -180,7 +298,8 @@ class DateTime extends \DateTime
 	}
 
 
-	public function getTimestamp(): int
+	#[\ReturnTypeWillChange]
+	public function getTimestamp()
 	{
 		$real = parent::getTimestamp();
 		$this->verifyRead('getTimestamp()', $real, fn(\DateTimeImmutable $s) => $s->getTimestamp());
@@ -188,7 +307,8 @@ class DateTime extends \DateTime
 	}
 
 
-	public function getOffset(): int
+	#[\ReturnTypeWillChange]
+	public function getOffset()
 	{
 		$real = parent::getOffset();
 		$this->verifyRead('getOffset()', $real, fn(\DateTimeImmutable $s) => $s->getOffset());
@@ -196,7 +316,8 @@ class DateTime extends \DateTime
 	}
 
 
-	public function getTimezone(): \DateTimeZone|false
+	#[\ReturnTypeWillChange]
+	public function getTimezone()
 	{
 		$real = parent::getTimezone();
 		$this->verifyRead('getTimezone()', $real, fn(\DateTimeImmutable $s) => $s->getTimezone());
@@ -204,7 +325,7 @@ class DateTime extends \DateTime
 	}
 
 
-	/** PHP 8.4+ */
+	/** PHP 8.4+, native return type is not tentative */
 	public function getMicrosecond(): int
 	{
 		$real = parent::getMicrosecond();
@@ -213,7 +334,8 @@ class DateTime extends \DateTime
 	}
 
 
-	public function diff(\DateTimeInterface $targetObject, bool $absolute = false): \DateInterval
+	#[\ReturnTypeWillChange]
+	public function diff(\DateTimeInterface $targetObject, bool $absolute = false)
 	{
 		$real = parent::diff($targetObject, $absolute);
 		$target = $targetObject instanceof self ? $targetObject : null;
@@ -260,7 +382,7 @@ class DateTime extends \DateTime
 				Reporter::report(
 					Reporter::DISCARDED_RESULT,
 					"result of $this->createdBy at $this->createdAt was never used, in dibi 5 this call does not change the original object.",
-					['site' => (string) $this->createdAt],
+					['site' => (string) $this->createdAt, 'call' => strstr($this->createdBy, '(', true)],
 				);
 			} catch (\Throwable $e) { // exception thrown from destructor is fatal during shutdown
 				error_log($e->getMessage());
@@ -274,8 +396,7 @@ class DateTime extends \DateTime
 	{
 		$this->verifyRead('serialize()', self::nativeData($this), fn(\DateTimeImmutable $s) => self::nativeData($s));
 		$data = method_exists(\DateTime::class, '__serialize') ? parent::__serialize() : (array) $this;
-		$prefix = "\0" . self::class . "\0";
-		return array_filter($data, fn($key) => !str_starts_with((string) $key, $prefix), ARRAY_FILTER_USE_KEY);
+		return self::withoutShimState($data);
 	}
 
 
@@ -297,7 +418,7 @@ class DateTime extends \DateTime
 
 	public function __debugInfo(): array
 	{
-		return self::nativeData($this);
+		return self::withoutShimState((array) $this) + self::nativeData($this);
 	}
 
 
@@ -307,17 +428,24 @@ class DateTime extends \DateTime
 	/**
 	 * Applies mutation with dibi 3 semantics (all aliases change) and returns a new alias
 	 * holding the dibi 4/5 value of the call result.
+	 * @param  ?array  $shadowArgs  arguments as dibi 5 receives them after type coercion
 	 */
-	private function mutate(string $method, array $args): static|false
+	private function mutate(string $method, array $args, ?array $shadowArgs = null): static|false
 	{
+		if ($this->group && !isset($this->group->members[$this])) { // clone made by subclass __clone() not calling parent
+			$this->group = $this->usage = $this->createdBy = $this->createdAt = null;
+		}
 		$this->usage()->used = true;
 		if (!Reporter::$enabled) {
 			if ($this->applyNative($method, $args) === false) {
 				return false;
 			}
-			foreach ($this->group?->members ?? [] as $member => $_) { // aliases created while enabled
-				if ($member !== $this) {
-					$member->copyNativeState($this);
+			if ($this->group) { // aliases created while enabled
+				$state = self::nativeState($this);
+				foreach ($this->group->members as $member => $_) {
+					if ($member !== $this) {
+						$member->copyNativeState($state);
+					}
 				}
 			}
 			return $this;
@@ -326,32 +454,38 @@ class DateTime extends \DateTime
 		$site = Reporter::callSite();
 		$call = $method . '(' . implode(', ', array_map([self::class, 'describe'], $args)) . ')';
 		$shadow = $this->shadow();
-		$wasInSync = $this->isInSync();
+		$before = date_format($this, self::STATE_FORMAT);
+		$wasInSync = $before === $this->shadowState();
 
 		if ($this->applyNative($method, $args) === false) { // PHP < 8.3 returns false for invalid modify(), in both versions
 			return false;
 		}
 
 		$result = clone $this;
+		$result->usage = new Usage; // created eagerly, so that clone of the result marks it as used
 		$shadowError = null;
 		try {
-			$result->shadow = $wasInSync
+			$result->shadow = $wasInSync && $shadowArgs === null
 				? \DateTimeImmutable::createFromMutable($result) // exact, avoids drift of relative formats like 'now'
-				: $shadow->$method(...$args);
+				: $shadow->$method(...($shadowArgs ?? $args));
 		} catch (\Throwable $shadowError) {
 			$result->shadow = \DateTimeImmutable::createFromMutable($result);
 		}
+		$after = date_format($this, self::STATE_FORMAT);
 		$result->divergedBy = $result->isInSync() ? [] : $this->divergedBy;
-		$result->createdBy = $call;
-		$result->createdAt = $site;
+		if ($after !== $before) { // no-op call behaves the same in dibi 5 even when the result is discarded
+			$result->createdBy = $call;
+			$result->createdAt = $site;
+		}
 
 		$this->group ??= self::createGroup($this);
 		$result->group = $this->group;
+		$state = self::nativeState($this);
 		foreach ($this->group->members as $member => $_) {
 			if ($member !== $this) {
-				$member->copyNativeState($this);
+				$member->copyNativeState($state);
 			}
-			$member->refreshDivergence($site, $call);
+			$member->refreshDivergence($site, $call, $after);
 		}
 		$this->group->members[$result] = true;
 
@@ -359,7 +493,7 @@ class DateTime extends \DateTime
 			Reporter::report(
 				Reporter::WOULD_THROW,
 				"$call at $site throws " . get_class($shadowError) . " in dibi 5: {$shadowError->getMessage()}",
-				['site' => $site],
+				['site' => $site, 'call' => $method],
 			);
 		}
 		return $result;
@@ -386,24 +520,70 @@ class DateTime extends \DateTime
 	}
 
 
-	/** Copies instant and timezone without calling overridden methods of $source. */
-	private function copyNativeState(self $source): void
+	/**
+	 * Instant and timezone of $source, computed once per mutation for all aliases.
+	 * @return array{\DateTimeZone, int[], \DateTimeZone}
+	 */
+	private static function nativeState(self $source): array
 	{
 		$state = \DateTimeImmutable::createFromMutable($source);
 		$utc = $state->setTimezone(new \DateTimeZone('UTC')); // UTC avoids DST ambiguity
-		[$y, $m, $d, $h, $i, $s, $u] = array_map('intval', explode(' ', $utc->format('Y n j G i s u'))); // no string parsing, works for years > 9999
-		parent::setTimezone($utc->getTimezone());
-		parent::setDate($y, $m, $d);
-		parent::setTime($h, $i, $s, $u);
-		parent::setTimezone($state->getTimezone());
+		$parts = array_map('intval', explode(' ', $utc->format('Y n j G i s u'))); // no string parsing, works for years > 9999
+		return [$utc->getTimezone(), $parts, $state->getTimezone()];
 	}
 
 
-	private function refreshDivergence(string $site, string $call): void
+	/**
+	 * Copies state from nativeState() without calling overridden methods.
+	 * @param  array{\DateTimeZone, int[], \DateTimeZone}  $state
+	 */
+	private function copyNativeState(array $state): void
 	{
-		if ($this->isInSync()) {
+		[$utc, [$y, $m, $d, $h, $i, $s, $u], $zone] = $state;
+		parent::setTimezone($utc);
+		parent::setDate($y, $m, $d);
+		parent::setTime($h, $i, $s, $u);
+		parent::setTimezone($zone);
+	}
+
+
+	/** @param  string  $realState  STATE_FORMAT of the real value, same for all aliases */
+	private function refreshDivergence(string $site, string $call, string $realState): void
+	{
+		if ($realState === $this->shadowState()) {
 			$this->divergedBy = [];
 		} elseif (!isset($this->divergedBy[$site]) && count($this->divergedBy) < 5) {
+			$this->divergedBy[$site] = $call;
+		}
+	}
+
+
+	/**
+	 * Shadow of a numeric (or coerced) constructor argument, dibi 5 converts the timestamp
+	 * through local time, which shifts DST-ambiguous hours and fails for years > 9999.
+	 */
+	private function initDibi5Construct(string|int $time, ?\DateTimeZone $timezone, ?string $site): void
+	{
+		$call = 'new Dibi\DateTime(' . self::describe($time) . ')';
+		$site ??= Reporter::callSite();
+		try {
+			if (is_numeric($time)) {
+				$timezone ??= new \DateTimeZone(date_default_timezone_get());
+				$tmp = (new \DateTimeImmutable('@' . $time))->setTimezone($timezone);
+				$dibi5 = new \DateTimeImmutable($tmp->format('Y-m-d H:i:s.u'), $tmp->getTimezone());
+			} else {
+				$dibi5 = new \DateTimeImmutable($time, $timezone);
+			}
+		} catch (\Throwable $e) {
+			Reporter::report(
+				Reporter::WOULD_THROW,
+				"$call at $site throws " . get_class($e) . " in dibi 5: {$e->getMessage()}",
+				['site' => $site, 'call' => 'new'],
+			);
+			return;
+		}
+		if ($dibi5->format(self::STATE_FORMAT) !== $this->shadowState()) {
+			$this->shadow = $dibi5;
 			$this->divergedBy[$site] = $call;
 		}
 	}
@@ -428,36 +608,55 @@ class DateTime extends \DateTime
 			return;
 		}
 
-		$mutations = $this->divergedBy + ($other ? $other->divergedBy : []);
+		$causes = $this->divergedBy + ($other ? $other->divergedBy : []);
 		$site = Reporter::callSite();
 		Reporter::report(
 			Reporter::DIVERGED_READ,
-			"$call at $site returns " . self::describe($real) . ", in dibi 5 it returns $expected. The object was changed in place by "
-				. ($mutations
-					? implode(', ', array_map(fn($site, $call) => "$call at $site", array_keys($mutations), $mutations))
+			"$call at $site returns " . self::describe($real) . ", in dibi 5 it returns $expected. Caused by "
+				. ($causes
+					? implode(', ', array_map(fn($site, $call) => "$call at $site", array_keys($causes), $causes))
 					: 'an untracked call (procedural date_*() function?)')
 				. '.',
-			['site' => $site, 'mutations' => implode(';', array_keys($mutations))],
+			['site' => $site, 'call' => strstr($call, '(', true), 'mutations' => implode(';', array_keys($causes))],
 		);
 	}
 
 
 	private function isInSync(): bool
 	{
-		return date_format($this, self::STATE_FORMAT) === $this->shadow()->format(self::STATE_FORMAT);
+		return date_format($this, self::STATE_FORMAT) === $this->shadowState();
 	}
 
 
 	private function shadow(): \DateTimeImmutable
 	{
-		// objects created without constructor (createFromFormat(), __set_state(), ...) are initialized lazily
+		// objects created without constructor (__set_state(), subclass factories, ...) are initialized lazily
 		return $this->shadow ??= \DateTimeImmutable::createFromMutable($this);
+	}
+
+
+	private function shadowState(): string
+	{
+		if ($this->shadowStateOf !== $this->shadow()) {
+			$this->shadowStateOf = $this->shadow;
+			$this->shadowState = $this->shadow->format(self::STATE_FORMAT);
+		}
+		return $this->shadowState;
 	}
 
 
 	private function usage(): Usage
 	{
 		return $this->usage ??= new Usage;
+	}
+
+
+	private static function track(mixed $object): mixed
+	{
+		if ($object instanceof self) { // shadow must exist before procedural date_*() functions can touch the object
+			$object->shadow = \DateTimeImmutable::createFromMutable($object);
+		}
+		return $object;
 	}
 
 
@@ -476,6 +675,13 @@ class DateTime extends \DateTime
 	}
 
 
+	private static function withoutShimState(array $data): array
+	{
+		$prefix = "\0" . self::class . "\0";
+		return array_filter($data, fn($key) => !str_starts_with((string) $key, $prefix), ARRAY_FILTER_USE_KEY);
+	}
+
+
 	private static function describe(mixed $value): string
 	{
 		return match (true) {
@@ -483,6 +689,7 @@ class DateTime extends \DateTime
 			$value instanceof \DateInterval => $value->format('%RP%yY%mM%dDT%hH%iM%sS.%F (days: %a)'),
 			$value instanceof \DateTimeInterface => \DateTimeImmutable::createFromInterface($value)->format(self::STATE_FORMAT),
 			is_array($value) => (string) json_encode($value),
+			is_object($value) => get_class($value),
 			default => var_export($value, true),
 		};
 	}
